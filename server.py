@@ -74,6 +74,13 @@
 - ✦ 修正：PRED_SIMS_CAP 預設改 80
 - ✦ 修正：移除 PF_N>=300 強制砍到 7/5 的硬限制（改為可控上限）
 - ✦ 修正：log 顯示實際 sims_used（避免以為跑 80 其實被 guard 壓掉）
+
+# ★ 2026-02-04 PATCH (HISTORY-MODE-ENABLE)
+- ✦ 修正：HISTORY_MODE 不再只是開關，真正啟用「歷史 outcome 序列」warm start
+  * session 保存 hist_outcomes（最近 N 局 outcome）
+  * PF per-uid stateful 但 PF 重新建立時（例如服務重啟 / store 丟失），會回放 hist_outcomes 熱身
+  * RESET/結束分析會清 hist_outcomes 與 pf_warm
+  * 新增 HISTORY_MAX（預設 50）
 """
 
 import os, sys, logging, time, re, json, threading
@@ -281,6 +288,11 @@ def get_session(uid: str) -> Dict[str, Any]:
                     sess["pending"] = False
                 if "pending_seq" not in sess:
                     sess["pending_seq"] = 0
+                # HISTORY (warm start)
+                if "hist_outcomes" not in sess:
+                    sess["hist_outcomes"] = []
+                if "pf_warm" not in sess:
+                    sess["pf_warm"] = 0
                 return sess
         sess = SESS_FALLBACK.get(uid)
         if isinstance(sess, dict):
@@ -290,6 +302,11 @@ def get_session(uid: str) -> Dict[str, Any]:
                 sess["pending"] = False
             if "pending_seq" not in sess:
                 sess["pending_seq"] = 0
+            # HISTORY (warm start)
+            if "hist_outcomes" not in sess:
+                sess["hist_outcomes"] = []
+            if "pf_warm" not in sess:
+                sess["pf_warm"] = 0
             return sess
     except Exception as e:
         log.warning("get_session error: %s", e)
@@ -305,6 +322,9 @@ def get_session(uid: str) -> Dict[str, Any]:
         "last_card_ts": None,
         "pending": False,
         "pending_seq": 0,
+        # HISTORY (warm start)
+        "hist_outcomes": [],
+        "pf_warm": 0,
     }
     save_session(uid, sess)
     return sess
@@ -344,7 +364,8 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
 
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80+historymode"
+
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -372,13 +393,17 @@ else:
 
     app = _DummyApp()
 
+
 # ---------- PF（Outcome PF） ----------
 PF_BACKEND = os.getenv("PF_BACKEND", "mc").lower()
 SKIP_TIE_UPD = env_flag("SKIP_TIE_UPD", 1)
 SOFT_TAU = float(os.getenv("SOFT_TAU", "2.0"))
 TIE_MIN = float(os.getenv("TIE_MIN", "0.05"))
 TIE_MAX = float(os.getenv("TIE_MAX", "0.15"))
+
+# ★ HISTORY_MODE 真正啟用：用 session 的 hist_outcomes warm start PF
 HISTORY_MODE = env_flag("HISTORY_MODE", 0)
+HISTORY_MAX = int(float(os.getenv("HISTORY_MAX", "50")))
 
 # ★ 可控的和局封頂 + debug
 TIE_CAP_ENABLE = env_flag("TIE_CAP_ENABLE", 1)   # 1=維持封頂，0=不封頂（避免卡 15%）
@@ -469,6 +494,10 @@ def _build_new_pf() -> Any:
 
 
 def get_pf_for_uid(uid: str) -> Any:
+    """
+    per-uid PF，必要時建立
+    - 若 HISTORY_MODE=1：建立後會由 _handle_points_and_predict() 決定是否 warm start
+    """
     if not uid:
         uid = "anon"
     with _PF_STORE_GUARD:
@@ -483,12 +512,24 @@ def get_pf_for_uid(uid: str) -> Any:
         return pf
 
 
-def reset_pf_for_uid(uid: str) -> None:
+def has_pf_for_uid(uid: str) -> bool:
     if not uid:
         uid = "anon"
     with _PF_STORE_GUARD:
-        if uid in _PF_STORE:
-            _PF_STORE.pop(uid, None)
+        return uid in _PF_STORE
+
+
+def reset_pf_for_uid(uid: str) -> None:
+    """
+    RESET/結束分析時：
+    - 清 PF store
+    - 同步清掉 lock（避免 UID 越來越多）
+    """
+    if not uid:
+        uid = "anon"
+    with _PF_STORE_GUARD:
+        _PF_STORE.pop(uid, None)
+        _PF_LOCKS.pop(uid, None)
 # ===== END =====
 
 pf_initialized = True if (OutcomePF is not None) else True
@@ -535,7 +576,6 @@ PROB_BIAS_B2P = float(os.getenv("PROB_BIAS_B2P", "0.0"))
 PROB_PURE_MODE = int(os.getenv("PROB_PURE_MODE", "0"))  # 1=純機率(pB>=pP選莊)，0=沿用既有邏輯
 
 # ★ PATCH: prob 模式自動強制純機率（避免你忘了設 PROB_PURE_MODE）
-# - 預設 1：DECISION_MODE=prob 時，若你沒設 PROB_PURE_MODE → 自動視為純機率
 PROB_FORCE_PURE_IN_PROB_MODE = env_flag("PROB_FORCE_PURE_IN_PROB_MODE", 1)
 
 
@@ -554,15 +594,8 @@ def _decide_side_by_ev(pB: float, pP: float) -> Tuple[int, float, float, float]:
 
 
 def _effective_prob_flags(over: Dict[str, float]) -> Tuple[int, int, List[str]]:
-    """
-    回傳 (eff_prob_pure, eff_ev_neutral, notes[])
-    - 若 DECISION_MODE=prob 且 PROB_FORCE_PURE_IN_PROB_MODE=1：
-        * 當 PROB_PURE_MODE 沒明確設定為 1/0（或為 0）時，也會強制用純機率（eff_prob_pure=1）
-        * 並且決策層面關閉 payout-aware（eff_ev_neutral=0）
-    """
     notes: List[str] = []
 
-    # 允許三段覆蓋（若有）
     eff_prob_pure = PROB_PURE_MODE
     eff_ev_neutral = EV_NEUTRAL
 
@@ -578,12 +611,9 @@ def _effective_prob_flags(over: Dict[str, float]) -> Tuple[int, int, List[str]]:
         pass
 
     if DECISION_MODE == "prob" and PROB_FORCE_PURE_IN_PROB_MODE == 1:
-        # 只要 prob 模式，就把決策層固定為「純機率」
         if eff_prob_pure != 1:
             notes.append("FORCE_PURE(prob 模式自動純機率)")
         eff_prob_pure = 1
-
-        # 並在決策層面直接關掉 payout-aware（避免莊勝率高卻叫下閒）
         if eff_ev_neutral != 0:
             notes.append("FORCE_EV_NEUTRAL_OFF(prob 純機率關閉 payout-aware)")
         eff_ev_neutral = 0
@@ -592,17 +622,14 @@ def _effective_prob_flags(over: Dict[str, float]) -> Tuple[int, int, List[str]]:
 
 
 def _decide_side_by_prob(pB: float, pP: float, eff_prob_pure: int, eff_ev_neutral: int) -> int:
-    # eff_prob_pure=1：永遠用純機率比較
     if int(eff_prob_pure) == 1:
         return 0 if pB >= pP else 1
-    # payout-aware（莊被打折）
     if int(eff_ev_neutral) == 1:
         return 0 if (BANKER_PAYOUT * pB) >= pP else 1
     return 0 if pB >= pP else 1
 
 
 def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
-    # 允許三段覆蓋 PROB_BIAS_B2P
     b2p = PROB_BIAS_B2P
     try:
         if "PROB_BIAS_B2P" in over:
@@ -627,7 +654,6 @@ def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
 
 
 def decide_only_bp(prob: np.ndarray, over: Dict[str, float]) -> Tuple[str, float, float, str]:
-    # 不在這裡套用 bias（避免顯示與決策不一致 / 避免雙重偏移）
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     reason: List[str] = []
 
@@ -641,7 +667,6 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float]) -> Tuple[str, float
         final_edge = max(abs(evB), abs(evP))
         reason.append(f"模式=prob(pure={eff_prob_pure},ev_neutral={eff_ev_neutral})")
 
-        # ★ 自檢防呆：純機率下不應出現 pB>pP 但選閒
         if int(eff_prob_pure) == 1 and pB > pP and side == 1:
             side = 0
             reason.append("⚠️ FIX: pure_prob 但選到閒→強制改莊")
@@ -714,7 +739,6 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
     over: Dict[str, float] = {}
     prefix = _stage_prefix(rounds_seen)
 
-    # ★ PATCH：允許三段覆蓋決策關鍵參數（可選）
     keys = [
         "SOFT_TAU", "THEO_BLEND", "TIE_MAX",
         "MIN_CONF_FOR_ENTRY", "EDGE_ENTER", "PROB_MARGIN",
@@ -743,11 +767,11 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
 def _depl_stage_scale(rounds_seen: int) -> float:
     prefix = _stage_prefix(rounds_seen)
     if prefix == "EARLY_":
-        return EARLY_DEPL_SCALE
+        return float(EARLY_DEPL_SCALE)
     elif prefix == "MID_":
-        return MID_DEPL_SCALE
+        return float(MID_DEPL_SCALE)
     else:
-        return LATE_DEPL_SCALE
+        return float(LATE_DEPL_SCALE)
 
 
 def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.ndarray:
@@ -765,17 +789,6 @@ def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.n
 
 # ---------- 預測效能保護 ----------
 def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
-    """
-    目的：
-    - 讓你可以把 PF_PRED_SIMS 拉高（例如 40~80），同時避免極端值卡死
-    - PRED_SIMS_CAP 預設 80（你可用 env 控制）
-    - 第二層 guard 可用 env 開關關閉，或自訂 PF_N>=300/350 時的上限
-      * PRED_GUARD_ENABLE：1=啟用(預設)；0=完全不壓制
-      * PRED_GUARD_300_CAP：PF_N>=300 的上限（預設沿用 PRED_SIMS_MAX_PF300 或 35）
-      * PRED_GUARD_350_CAP：PF_N>=350 的上限（預設沿用 PRED_SIMS_MAX_PF350 或 25）
-      * （兼容舊變數）PRED_SIMS_MAX_PF300 / PRED_SIMS_MAX_PF350 仍可用
-    """
-    # ① 全域硬上限（你可以用 env 調整）
     try:
         cap = int(float(os.getenv("PRED_SIMS_CAP", "80")))
     except Exception:
@@ -783,15 +796,13 @@ def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
 
     n = max(1, min(int(base), int(cap)))
 
-    # ② 針對高 PF_N 的保護上限（可控開關）
-    guard_enable = env_flag("PRED_GUARD_ENABLE", 1)  # 1=啟用(預設), 0=不壓制
+    guard_enable = env_flag("PRED_GUARD_ENABLE", 1)
     if guard_enable != 1:
         return max(1, int(n))
 
     try:
         n_particles = int(getattr(pf_obj, "n_particles", 0) or 0)
 
-        # 兼容：新變數優先，其次沿用舊變數
         def _get_int_env(primary: str, fallback: str, default_val: int) -> int:
             v = os.getenv(primary)
             if v not in (None, ""):
@@ -851,77 +862,67 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
         return (int(d[0]), int(d[1]))
     return None
 
-# --------------------------------------------------
-# Debug/Test utilities
-# --------------------------------------------------
-def test_deplete_biases() -> None:
-    if not DEPLETE_OK or init_counts is None or probs_after_points is None:
-        log.warning("test_deplete_biases called but deplete support is unavailable")
-        return
-    try:
-        decks = int(os.getenv("DECKS", "8"))
-        counts = init_counts(decks)
-        sims_env = os.getenv("DEPLETEMC_SIMS")
-        sims = int(float(sims_env)) if sims_env else 10000
-        deplete_factor = float(os.getenv("DEPL_FACTOR", "0.60"))
-        scenarios = [
-            ("開局", 0, 0),
-            ("閒贏1點", 1, 0),
-            ("莊贏1點", 0, 1),
-            ("平手1點", 1, 1),
-            ("閒贏6點", 6, 0),
-            ("莊贏6點", 0, 6),
-        ]
-        log.info("=== Deplete 偏差測試 (sims=%d, factor=%.2f) ===", sims, deplete_factor)
-        for name, p_pts, b_pts in scenarios:
-            try:
-                probs = probs_after_points(counts, p_pts, b_pts, sims=sims, deplete_factor=deplete_factor)
-                if not isinstance(probs, (list, tuple, np.ndarray)) or len(probs) < 2:
-                    log.info("%s: unexpected deplete result %s", name, probs)
-                    continue
-                pB, pP, pT = float(probs[0]), float(probs[1]), float(probs[2] if len(probs) > 2 else 0.0)
-                diff = pB - pP
-                bias = "莊高" if diff > 0 else ("閒高" if diff < 0 else "平手")
-                log.info(
-                    "%s: 莊=%.4f 閒=%.4f 和=%.4f | 差值=%.4f (%s)",
-                    name, pB, pP, pT, diff, bias
-                )
-            except Exception as ex:
-                log.warning("test_deplete_biases scenario %s failed: %s", name, ex)
-    except Exception as ex:
-        log.warning("test_deplete_biases error: %s", ex)
-
-
-def debug_card_distribution() -> None:
-    if not DEPLETE_OK or init_counts is None:
-        log.warning("debug_card_distribution called but deplete support is unavailable")
-        return
-    try:
-        decks = int(os.getenv("DECKS", "8"))
-        counts = init_counts(decks)
-        total_cards = sum(counts.values()) if isinstance(counts, dict) else sum(counts)
-        point_cards: Dict[int, int] = {}
-        if isinstance(counts, dict):
-            iterable = counts.items()
-        else:
-            iterable = enumerate(counts)
-        for card_value, count in iterable:
-            try:
-                val = int(card_value)
-            except Exception:
-                continue
-            point = min(10, val if val > 0 else 10)
-            point_cards[point] = point_cards.get(point, 0) + int(count)
-        log.info("牌組分布:")
-        for point in sorted(point_cards.keys()):
-            cnt = point_cards[point]
-            pct = (cnt / total_cards * 100.0) if total_cards else 0.0
-            log.info("  點數 %s: %s 張 (%.1f%%)", point, cnt, pct)
-    except Exception as ex:
-        log.warning("debug_card_distribution error: %s", ex)
-
 
 # ---------- 主預測 ----------
+def _append_history(sess: Dict[str, Any], outcome_code: int) -> None:
+    """HISTORY_MODE：保存最近 N 局 outcome（0=B,1=P,2=T）"""
+    try:
+        hist = sess.get("hist_outcomes")
+        if not isinstance(hist, list):
+            hist = []
+        hist.append(int(outcome_code))
+        maxn = int(float(os.getenv("HISTORY_MAX", str(HISTORY_MAX))))
+        if maxn > 0 and len(hist) > maxn:
+            hist = hist[-maxn:]
+        sess["hist_outcomes"] = hist
+    except Exception:
+        pass
+
+
+def _warm_start_pf_if_needed(uid: str, sess: Dict[str, Any], pf_obj: Any) -> None:
+    """
+    HISTORY_MODE 真正啟用：
+    - 只在 PF 重新建立/或尚未 warm 時回放 hist_outcomes
+    - 避免每次都 replay 造成重複學習
+    """
+    if HISTORY_MODE != 1:
+        return
+    if PF_STATEFUL != 1:
+        return
+    try:
+        if int(sess.get("pf_warm", 0)) == 1:
+            return
+    except Exception:
+        pass
+
+    hist = sess.get("hist_outcomes", [])
+    if not isinstance(hist, list) or not hist:
+        sess["pf_warm"] = 1
+        return
+
+    # 回放前：若已經有 PF store，但你還沒 warm，代表「服務重啟」或「reset store」後第一次進來
+    # 這時回放 history 可以把 PF 拉回合理狀態
+    try:
+        cnt = 0
+        for oc in hist:
+            try:
+                oc_i = int(oc)
+            except Exception:
+                continue
+            if oc_i == 2 and SKIP_TIE_UPD:
+                continue
+            try:
+                pf_obj.update_outcome(oc_i)
+            except Exception:
+                pf_obj.update_outcome("T" if oc_i == 2 else ("B" if oc_i == 0 else "P"))
+            cnt += 1
+        sess["pf_warm"] = 1
+        log.info("[HISTORY] warm start applied: replay=%d uid=%s", cnt, uid)
+    except Exception as e:
+        sess["pf_warm"] = 1
+        log.warning("[HISTORY] warm start failed (skip): %s", e)
+
+
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
@@ -929,28 +930,39 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     pf_probs: Optional[np.ndarray] = None
     soft_probs: Optional[np.ndarray] = None
 
-    # ★ PATCH：記錄 base vs used（讓 log 顯示你真的跑多少 sims）
     sims_base = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
-    sims_used = sims_base  # 會被 _tuned_pred_sims 覆蓋
+    sims_used = sims_base
+
+    # 先把 outcome 轉成 code（0=B,1=P,2=T）
+    if p_pts == b_pts:
+        outcome_code = 2
+    else:
+        outcome_code = 0 if b_pts > p_pts else 1
+
+    # HISTORY：保存本局 outcome（注意：這是「上一局結果」輸入，所以是用來影響下一局預測）
+    if HISTORY_MODE == 1:
+        _append_history(sess, outcome_code)
 
     if PF_STATEFUL == 1:
         pf_obj = get_pf_for_uid(uid)
         lk = _get_uid_lock(uid)
         with lk:
+            # ★ HISTORY warm start：只有在 PF 可能重新建立/或尚未 warm 時回放
+            _warm_start_pf_if_needed(uid, sess, pf_obj)
+
             try:
                 if hasattr(pf_obj, "update_outcome"):
-                    if (p_pts == b_pts):
+                    if outcome_code == 2:
                         if not SKIP_TIE_UPD:
                             try:
                                 pf_obj.update_outcome(2)
                             except Exception:
                                 pf_obj.update_outcome("T")
                     else:
-                        outcome = 0 if b_pts > p_pts else 1
                         try:
-                            pf_obj.update_outcome(outcome)
+                            pf_obj.update_outcome(outcome_code)
                         except Exception:
-                            pf_obj.update_outcome("B" if outcome == 0 else "P")
+                            pf_obj.update_outcome("B" if outcome_code == 0 else "P")
             except Exception as e:
                 log.warning("PF.update_outcome failed: %s", e)
 
@@ -1113,10 +1125,10 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
     if LOG_DECISION or SHOW_CONF_DEBUG:
         log.info(
-            "決策: %s edge=%.4f pct=%.2f%% rounds=%d sims_base=%d sims_used=%d uid=%s stateful=%s | %s",
+            "決策: %s edge=%.4f pct=%.2f%% rounds=%d sims_base=%d sims_used=%d uid=%s stateful=%s history=%s warm=%s | %s",
             choice, edge, bet_pct * 100, sess["rounds_seen"],
             int(sims_base), int(sims_used),
-            uid, PF_STATEFUL, reason
+            uid, PF_STATEFUL, HISTORY_MODE, int(sess.get("pf_warm", 0)), reason
         )
     return p, choice, bet_amt, reason
 
@@ -1129,17 +1141,13 @@ TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 
-# ★ TRIAL namespace（避免不同 bot 共用 trial key）
 TRIAL_NAMESPACE = os.getenv("TRIAL_NAMESPACE", "default").strip() or "default"
 
 LINE_PUSH_ENABLE = env_flag("LINE_PUSH_ENABLE", 1)
 LINE_PUSH_COOLDOWN_SECONDS = int(os.getenv("LINE_PUSH_COOLDOWN_SECONDS", str(30 * 24 * 3600)))
 _PUSH_BLOCK_UNTIL = 0
 
-# ===== PATCH: 避免卡「正在計算」 =====
-# - 若 push 被擋（429/disabled）時，改成「同步 reply 最終結果」不走 background push
 LINE_ASYNC_HEAVY = env_flag("LINE_ASYNC_HEAVY", 1)
-# ===== PATCH END =====
 
 
 def _can_push() -> bool:
@@ -1167,11 +1175,9 @@ def _looks_like_429(e: Exception) -> bool:
 
 
 def _trial_key(uid: str, kind: str) -> str:
-    # ★ namespace：避免不同 Bot/不同部署共用同一組 trial keys
     return f"trial:{TRIAL_NAMESPACE}:{kind}:{uid}"
 
 
-# ★ BLOCK-TRIAL：封鎖即永久失效試用
 def _trial_block_key(uid: str) -> str:
     return _trial_key(uid, "blocked")
 
@@ -1465,7 +1471,10 @@ try:
                 sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0,
                         "last_pts_text": None, "premium": premium, "trial_start": start_ts,
                         "last_card": None, "last_card_ts": None,
-                        "pending": False, "pending_seq": 0}
+                        "pending": False, "pending_seq": 0,
+                        # HISTORY reset
+                        "hist_outcomes": [],
+                        "pf_warm": 0}
                 try:
                     reset_pf_for_uid(uid)
                 except Exception:
@@ -1517,11 +1526,6 @@ try:
             if pts and sess.get("bankroll", 0) >= 0:
                 p_pts, b_pts = pts
 
-                # ===== PATCH (LINE-NO-STUCK) =====
-                # 若 push 被擋/disabled（_can_push()=False）時：
-                # - 不走「先回正在計算 + 背景 push」
-                # - 直接同步算完並用同一個 reply_token 回最終結果（避免永遠卡住）
-                # push 可用且你允許 async 時，才維持原本行為
                 if (LINE_ASYNC_HEAVY == 1) and _can_push():
                     _reply(
                         line_api,
@@ -1546,7 +1550,6 @@ try:
                         log.exception("failed to spawn heavy prediction thread: %s", e)
                     return
                 else:
-                    # push 不可用（或你關掉 async）→ 直接回最終結果
                     try:
                         if (p_pts == b_pts and SKIP_TIE_UPD):
                             sess["last_pts_text"] = "上局結果: 和局"
@@ -1567,7 +1570,6 @@ try:
                         log.exception("[LINE] sync predict failed: %s", e)
                         _reply(line_api, event.reply_token, "⚠️ 計算失敗，請稍後再試或輸入下一局點數。")
                     return
-                # ===== PATCH END =====
 
             _reply(
                 line_api,
@@ -1639,6 +1641,8 @@ def health():
         pf_initialized=pf_initialized,
         pf_backend=(PF_BACKEND if OutcomePF is not None else "smart-dummy"),
         pf_stateful=bool(PF_STATEFUL),
+        history_mode=bool(HISTORY_MODE),
+        history_max=int(os.getenv("HISTORY_MAX", str(HISTORY_MAX))),
         prob_force_pure_in_prob_mode=bool(PROB_FORCE_PURE_IN_PROB_MODE),
         line_async_heavy=bool(LINE_ASYNC_HEAVY),
         line_can_push=bool(_can_push()),
@@ -1689,10 +1693,11 @@ if __name__ == "__main__":
 
     log.info(
         "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, "
-        "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f, "
+        "PF_STATEFUL=%s, HISTORY_MODE=%s, HISTORY_MAX=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f, "
         "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PRED_SIMS_MAX_PF300=%s, PRED_SIMS_MAX_PF350=%s)",
         VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE,
-        PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P),
+        PF_STATEFUL, HISTORY_MODE, os.getenv("HISTORY_MAX", str(HISTORY_MAX)),
+        TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P),
         LINE_ASYNC_HEAVY, LINE_PUSH_ENABLE,
         os.getenv("PRED_SIMS_CAP", "80"),
         os.getenv("PRED_SIMS_MAX_PF300", "35"),
